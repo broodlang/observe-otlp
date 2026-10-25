@@ -1,0 +1,125 @@
+;; The OTLP/JSON wire format, and the provider against a recording transport — what URL,
+;; headers and body each batch becomes. No network: `:transport` is a function.
+(defmodule observe-otlp-test
+  (:use test)
+  (:use observe-otlp)
+  (:alias observe)
+  (:alias json)
+  (:alias gen))
+
+;; A transport that records every request it was handed and answers `status`.
+(gen/defserver recorder
+  (requests)
+  (cast [:request address body headers] (conj requests [address body headers]))
+  (query :requests requests))
+
+(defn- recording (status)
+  (let (pid (gen/start recorder []))
+    {:pid pid
+     :transport (fn (address body headers)
+                  (gen/cast pid [:request address body headers])
+                  {:status status :headers {} :body #b"" :error "refused"})}))
+
+(defn- requests (r) (gen/call (get r :pid) :requests))
+
+(def- context {:hostname "web-1" :env "prod" :revision "abc123" :app "hive"})
+
+(defn- attribute (attrs key)
+  (get (seq/find attrs (fn (a) (= (get a :key) key))) :value))
+
+(describe "attributes and values"
+  (test "each kind of value as OTLP writes it, ints as decimal strings"
+    (assert= {:stringValue "x"} (any-value "x"))
+    (assert= {:intValue "3"} (any-value 3))
+    (assert= {:doubleValue 1.5} (any-value 1.5))
+    (assert= {:boolValue true} (any-value true))
+    (assert= {:stringValue "warn"} (any-value :warn))
+    (assert= {:stringValue "[1 2]"} (any-value [1 2])))
+  (test "a map becomes key/value attributes, nil values left out"
+    (let (attrs (attributes {:path "/x" "n" 3 :gone nil}))
+      (assert= 2 (count attrs))
+      (assert= {:stringValue "/x"} (attribute attrs "path"))
+      (assert= {:intValue "3"} (attribute attrs "n")))))
+
+(describe "logs"
+  (test "a record: nanosecond time, OpenTelemetry's severity number, body and attributes"
+    (let (r (log-record {:ts 1700000000123 :level :warn :message "disk low" :meta {:path "/x"}}))
+      (assert= "1700000000123000000" (:timeUnixNano r))
+      (assert= 13 (:severityNumber r))
+      (assert= "WARN" (:severityText r))
+      (assert= {:stringValue "disk low"} (:body r))
+      (assert= {:stringValue "/x"} (attribute (:attributes r) "path"))))
+  (test "an unknown level is INFO"
+    (assert= 9 (:severityNumber (log-record {:ts 0 :level :chatty :message "m"}))))
+  (test "the request carries the run as its resource"
+    (let (p (provider {:service "hive"})
+          attrs (get-in (logs-request p context []) [:resourceLogs 0 :resource :attributes]))
+      (assert= {:stringValue "hive"} (attribute attrs "service.name"))
+      (assert= {:stringValue "prod"} (attribute attrs "deployment.environment"))
+      (assert= {:stringValue "abc123"} (attribute attrs "service.version"))
+      (assert= {:stringValue "web-1"} (attribute attrs "host.name")))))
+
+(describe "errors"
+  (test "an error report is an ERROR record with exception.* attributes"
+    (let (r (error-record {:ts 1000
+                           :name "badarg"
+                           :message "boom"
+                           :backtrace ["a.blsp:1" "b.blsp:2"]
+                           :tags {:route "/x"}}))
+      (assert= 17 (:severityNumber r))
+      (assert= {:stringValue "badarg"} (attribute (:attributes r) "exception.type"))
+      (assert= {:stringValue "boom"} (attribute (:attributes r) "exception.message"))
+      (assert= {:stringValue "a.blsp:1\nb.blsp:2"}
+        (attribute (:attributes r) "exception.stacktrace"))
+      (assert= {:stringValue "/x"} (attribute (:attributes r) "route")))))
+
+(describe "metrics"
+  (test "a gauge, a counter as a monotonic delta sum, a timing as a gauge in ms"
+    (let (gauge (metric {:name "queue" :kind :gauge :value 4 :ts 1})
+          counter (metric {:name "requests" :kind :counter :value 1 :ts 1 :tags {:code 200}})
+          timing (metric {:name "latency" :kind :timing :value 12 :ts 1}))
+      (assert= 4.0 (get-in gauge [:gauge :dataPoints 0 :asDouble]))
+      (assert= 1 (get-in counter [:sum :aggregationTemporality]))
+      (is (get-in counter [:sum :isMonotonic]))
+      (assert= {:intValue "200"}
+        (attribute (get-in counter [:sum :dataPoints 0 :attributes]) "code"))
+      (assert= "ms" (:unit timing))
+      (assert= 12.0 (get-in timing [:gauge :dataPoints 0 :asDouble])))))
+
+(describe "the provider"
+  (test "logs, metrics and errors POST JSON to their paths with the configured headers"
+    (let (r (recording 200)
+          p (provider {:endpoint "http://collector:4318/"
+                       :headers {"x-api-key" "k"}
+                       :service "hive"
+                       :transport (get r :transport)}))
+      (assert= :ok (observe/ship-logs p context [{:ts 1 :level :info :message "up"}]))
+      (assert= :ok (observe/ship-metrics p context [{:name "n" :kind :gauge :value 1 :ts 1}]))
+      (assert= :ok (observe/ship-errors p context [{:ts 1 :name "e" :message "m"}]))
+      (let (sent (requests r))
+        (assert= ["http://collector:4318/v1/logs"
+                   "http://collector:4318/v1/metrics" "http://collector:4318/v1/logs"]
+          (into [] (map sent first)))
+        (assert= {"x-api-key" "k"} (nth (first sent) 2))
+        (assert= "up"
+          (get-in (json/decode (second (first sent)))
+            [:resourceLogs 0 :scopeLogs 0 :logRecords 0 :body :stringValue])))))
+  (test "a refusal is an error the shipper can log"
+    (let (r (recording 401)
+          p (provider {:transport (get r :transport)}))
+      (assert= [:error "observe-otlp: /v1/logs answered 401"]
+        (observe/ship-logs p context [{:ts 1 :level :info :message "m"}])))))
+
+(describe "configuration from the environment"
+  (test "the standard variables"
+    (assert= {:endpoint "https://otlp.example"
+              :headers {"api-key" "abc" "x-team" "t"}
+              :service "hive"}
+      (settings {"OTEL_EXPORTER_OTLP_ENDPOINT" " https://otlp.example "
+                 "OTEL_EXPORTER_OTLP_HEADERS" "api-key=abc, x-team = t"
+                 "OTEL_SERVICE_NAME" "hive"})))
+  (test "no endpoint, or a blank one, is no provider"
+    (is (nil? (settings {})))
+    (is (nil? (settings {"OTEL_EXPORTER_OTLP_ENDPOINT" "  "}))))
+  (test "a header entry without = is dropped"
+    (assert= {"a" "1"} (parse-headers "a=1,broken"))))

@@ -1,0 +1,217 @@
+;; observe-otlp — OpenTelemetry as an `observe` provider, over OTLP/HTTP with the JSON
+;; encoding (https://opentelemetry.io/docs/specs/otlp/).
+;;
+;; One wire format reaches every backend that speaks OpenTelemetry: a local collector,
+;; Grafana, Honeycomb, Datadog, New Relic, SigNoz, Uptrace — each takes OTLP at an endpoint
+;; with an auth header. Logs go to `/v1/logs`, metrics to `/v1/metrics`. An error is a log
+;; record at ERROR severity carrying the semantic convention's `exception.*` attributes,
+;; which is how OpenTelemetry records an exception outside a span: `observe` has no traces
+;; to put a span event on.
+(defmodule observe-otlp
+  "OpenTelemetry (OTLP/HTTP, JSON) as an `observe` provider.
+
+      (observe/start {:provider (observe-otlp/provider
+                                  {:endpoint \"https://api.honeycomb.io\"
+                                   :headers {\"x-honeycomb-team\" (os/env \"HONEYCOMB_KEY\")}
+                                   :service \"hive\"})
+                      :env \"prod\" :revision (os/env \"FLY_MACHINE_VERSION\")})
+
+  Or from the standard OpenTelemetry variables — `OTEL_EXPORTER_OTLP_ENDPOINT`,
+  `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME` — with `(observe-otlp/from-environment)`."
+  (:load observe)
+  (:alias http)
+  (:alias json)
+  (:alias string)
+  (:alias log)
+  (:alias os))
+
+(def *endpoint* "http://localhost:4318")
+;; The default: a collector on this machine, OTLP/HTTP's well-known port.
+
+;; ---- the provider value ---------------------------------------------------------------
+
+(defrecord otlp (endpoint headers service transport))
+
+(defn provider (opts)
+  "A provider from `opts`: `:endpoint` (the OTLP/HTTP base URL, default
+  `http://localhost:4318`; `/v1/logs` and `/v1/metrics` are appended), `:headers` (sent with
+  every request — where a vendor's API key goes), `:service` (`service.name`, default
+  `\"brood\"`), `:transport` (a `(fn (url body headers) -> response)`, default `http/post` —
+  for a test)."
+  (otlp (let (e (get opts :endpoint *endpoint*))
+          (if (string/ends-with? e "/") (string/substring e 0 (dec (string/length e))) e))
+    (get opts :headers {})
+    (get opts :service "brood")
+    (get opts :transport http-post)))
+
+(defn- http-post (address body headers)
+  (http/post address body {:headers (merge {"Content-Type" "application/json"} headers)}))
+
+(defn parse-headers (text)
+  "`OTEL_EXPORTER_OTLP_HEADERS`'s `key=value,key2=value2` as a map; an entry without `=` is
+  dropped, and blanks around keys and values are trimmed.
+
+      (observe-otlp/parse-headers \"api-key=abc, x-team = t\") ;=> {\"api-key\" \"abc\" \"x-team\" \"t\"}"
+  (if (or (nil? text) (string/blank? text))
+    {}
+    (into {}
+      (seq/keep (string/split text ",")
+        (fn (entry)
+          (let (at (index-of entry "="))
+            (when (> at 0)
+              [(string/trim (string/substring entry 0 at))
+                (string/trim (string/substring entry (inc at) (string/length entry)))])))))))
+
+(defn settings (env)
+  "The provider's options from an environment map (`var → value`): `{:endpoint :headers
+  :service}` from the standard `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`
+  and `OTEL_SERVICE_NAME`, or nil when no endpoint is set (a blank counts as unset).
+
+      (observe-otlp/settings {\"OTEL_EXPORTER_OTLP_ENDPOINT\" \"http://c:4318\"}) ;=> {:endpoint \"http://c:4318\" :headers {} :service nil}"
+  (let (endpoint (get env "OTEL_EXPORTER_OTLP_ENDPOINT"))
+    (when (and (string? endpoint) (not (string/blank? endpoint)))
+      {:endpoint (string/trim endpoint)
+       :headers (parse-headers (get env "OTEL_EXPORTER_OTLP_HEADERS"))
+       :service (let (name (get env "OTEL_SERVICE_NAME"))
+                  (when (and (string? name) (not (string/blank? name))) (string/trim name)))})))
+
+(def *variables*
+  ;; Every variable `settings` reads.
+  ["OTEL_EXPORTER_OTLP_ENDPOINT" "OTEL_EXPORTER_OTLP_HEADERS" "OTEL_SERVICE_NAME"])
+
+(defn from-environment (&optional (service "brood"))
+  "The provider from the process environment's OpenTelemetry variables (see `settings`),
+  `service` naming it when `OTEL_SERVICE_NAME` does not — or nil when no endpoint is set,
+  which `observe/boot` drops, and the log says so."
+  (let (found (settings (into {} (map *variables* (fn (variable) [variable (os/env variable)])))))
+    (if (nil? found)
+      (do
+        (log/warn "monitoring: OTEL_EXPORTER_OTLP_ENDPOINT is not set; nothing goes to OpenTelemetry")
+        nil)
+      (provider (assoc found :service (or (get found :service) service))))))
+
+(defn- post (p path body)
+  ;; POST `body` to `path`; `:ok` on a 2xx, `[:error message]` otherwise
+  (let (resp ((get p :transport) (str (get p :endpoint) path) body (get p :headers))
+        status (get resp :status 0))
+    (cond
+      (and (>= status 200) (< status 300)) :ok
+      (= status 0) [:error (str "observe-otlp: " (get resp :error "no response"))]
+      :else [:error (str "observe-otlp: " path " answered " status)])))
+
+(impl Provider
+  otlp
+  (ship-logs [p context records]
+    (post p "/v1/logs" (json/encode (logs-request p context (map records log-record)))))
+  (ship-metrics [p context metrics]
+    (post p "/v1/metrics" (json/encode (metrics-request p context metrics))))
+  ;; Errors are log records too, at ERROR, with `exception.*` (see the file header).
+  (ship-errors [p context reports]
+    (post p "/v1/logs" (json/encode (logs-request p context (map reports error-record))))))
+
+;; ---- the shared envelope ------------------------------------------------------------
+;; OTLP/JSON writes an attribute as `{key, value: {stringValue | intValue | doubleValue |
+;; boolValue}}`, and every 64-bit integer — `timeUnixNano`, `intValue` — as a decimal STRING
+;; (the protobuf JSON mapping), since a JSON number loses precision past 2^53.
+
+(defn any-value (v)
+  "`v` as an OTLP `AnyValue`: a string, int, float or bool as itself (an int as a decimal
+  string), anything else printed.
+
+      (observe-otlp/any-value 3) ;=> {:intValue \"3\"}"
+  (cond
+    (string? v) {:stringValue v}
+    (bool? v) {:boolValue v}
+    (int? v) {:intValue (str v)}
+    (float? v) {:doubleValue v}
+    (nil? v) {:stringValue "nil"}
+    (keyword? v) {:stringValue (string/substring (str v) 1)}
+    :else {:stringValue (pr-str v)}))
+
+(defn- attribute-key (k)
+  (cond
+    (keyword? k) (string/substring (str k) 1)
+    (string? k) k
+    :else (str k)))
+
+(defn attributes (m)
+  "A map as OTLP attributes: `[{:key \"k\" :value <AnyValue>} …]`, nil values left out."
+  (into []
+    (seq/keep (or m {})
+      (fn ([k v]) (when (not (nil? v)) {:key (attribute-key k) :value (any-value v)})))))
+
+(defn resource (p context)
+  "The OTLP resource every batch is reported under: `service.name`, and from the run's
+  context `deployment.environment`, `service.version` (the revision) and `host.name`."
+  {:attributes (attributes {"service.name" (get p :service)
+                            "deployment.environment" (get context :env)
+                            "service.version" (when (get context :revision)
+                                                (str (get context :revision)))
+                            "host.name" (get context :hostname)})})
+
+(def *scope* {:name "brood.observe" :version "0.1.0"})
+
+(defn nanos (ms)
+  "Epoch milliseconds as OTLP's `timeUnixNano`: a decimal string of nanoseconds."
+  (str (* (or ms 0) 1000000)))
+
+;; ---- logs and errors ----------------------------------------------------------------
+
+(def *severities*
+  ;; OpenTelemetry's severity numbers: the first of each range (DEBUG 5, INFO 9, WARN 13,
+  ;; ERROR 17)
+  {:debug [5 "DEBUG"] :info [9 "INFO"] :warn [13 "WARN"] :error [17 "ERROR"]})
+
+(defn log-record (record)
+  "One `observe` log record (`{:ts :level :message :meta}`) as an OTLP `LogRecord`."
+  (let ([number text] (get *severities* (get record :level) [9 "INFO"]))
+    {:timeUnixNano (nanos (get record :ts))
+     :severityNumber number
+     :severityText text
+     :body {:stringValue (str (get record :message ""))}
+     :attributes (attributes (get record :meta))}))
+
+(defn error-record (report)
+  "One `observe` error report as an OTLP `LogRecord` at ERROR with the semantic convention's
+  `exception.type`, `exception.message` and `exception.stacktrace`, plus its tags and
+  params."
+  {:timeUnixNano (nanos (get report :ts))
+   :severityNumber 17
+   :severityText "ERROR"
+   :body {:stringValue (str (get report :message ""))}
+   :attributes (attributes (merge (or (get report :tags) {})
+                             (or (get report :params) {})
+                             {"exception.type" (str (get report :name "error"))
+                              "exception.message" (str (get report :message ""))
+                              "exception.stacktrace" (string/join (map (or (get report :backtrace)
+                                                                         [])
+                                                                    str)
+                                                       "\n")
+                              "code.namespace" (get report :namespace)
+                              "brood.action" (get report :action)}))})
+
+(defn logs-request (p context log-records)
+  "An `ExportLogsServiceRequest` carrying `log-records` under this run's resource."
+  {:resourceLogs [{:resource (resource p context)
+                   :scopeLogs [{:scope *scope* :logRecords (into [] log-records)}]}]})
+
+;; ---- metrics --------------------------------------------------------------------------
+;; A gauge is a gauge; a counter a monotonic DELTA sum (each batch carries what was added
+;; since the last); a timing a gauge in milliseconds — what `observe` keeps is a sample,
+;; not a distribution, so a histogram would claim more than it knows.
+
+(defn metric (m)
+  "One `observe` metric (`{:name :kind :value :tags :ts}`) as an OTLP `Metric`."
+  (let (point {:timeUnixNano (nanos (or (get m :ts) (os/now)))
+               :asDouble (->float (get m :value 0))
+               :attributes (attributes (get m :tags))}
+        name (str (get m :name)))
+    (case (get m :kind)
+      :counter {:name name :sum {:dataPoints [point] :aggregationTemporality 1 :isMonotonic true}}
+      :timing {:name name :unit "ms" :gauge {:dataPoints [point]}}
+      {:name name :gauge {:dataPoints [point]}})))
+
+(defn metrics-request (p context metrics)
+  "An `ExportMetricsServiceRequest` carrying `metrics` under this run's resource."
+  {:resourceMetrics [{:resource (resource p context)
+                      :scopeMetrics [{:scope *scope* :metrics (into [] (map metrics metric))}]}]})

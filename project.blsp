@@ -1,0 +1,11 @@
+;; observe-otlp — OpenTelemetry (OTLP over HTTP, JSON encoding) as an `observe` provider:
+;; logs, metrics and errors to any OTLP collector or vendor endpoint. The batching,
+;; buffering and the request worker are `observe`'s; this package is the wire format.
+(project
+  :name "observe-otlp"
+  :version "0.1.0"
+  :brood ">= 0.43.0"
+  :description
+    "OpenTelemetry (OTLP/HTTP, JSON) as an `observe` provider — logs, metrics and errors to any collector."
+  :repository "https://github.com/broodlang/observe-otlp"
+  :dependencies [[observe :version "^0.1.2"]])
