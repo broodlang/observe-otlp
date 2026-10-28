@@ -53,7 +53,7 @@
     (assert= 9 (:severityNumber (log-record {:ts 0 :level :chatty :message "m"}))))
   (test "the request carries the run as its resource"
     (let (p (provider {:service "hive"})
-          attrs (get-in (logs-request p context []) [:resourceLogs 0 :resource :attributes]))
+          attrs (map/get-in (logs-request p context []) [:resourceLogs 0 :resource :attributes]))
       (assert= {:stringValue "hive"} (attribute attrs "service.name"))
       (assert= {:stringValue "prod"} (attribute attrs "deployment.environment"))
       (assert= {:stringValue "abc123"} (attribute attrs "service.version"))
@@ -78,13 +78,13 @@
     (let (gauge (metric {:name "queue" :kind :gauge :value 4 :ts 1})
           counter (metric {:name "requests" :kind :counter :value 1 :ts 1 :tags {:code 200}})
           timing (metric {:name "latency" :kind :timing :value 12 :ts 1}))
-      (assert= 4.0 (get-in gauge [:gauge :dataPoints 0 :asDouble]))
-      (assert= 1 (get-in counter [:sum :aggregationTemporality]))
-      (is (get-in counter [:sum :isMonotonic]))
+      (assert= 4.0 (map/get-in gauge [:gauge :dataPoints 0 :asDouble]))
+      (assert= 1 (map/get-in counter [:sum :aggregationTemporality]))
+      (is (map/get-in counter [:sum :isMonotonic]))
       (assert= {:intValue "200"}
-        (attribute (get-in counter [:sum :dataPoints 0 :attributes]) "code"))
+        (attribute (map/get-in counter [:sum :dataPoints 0 :attributes]) "code"))
       (assert= "ms" (:unit timing))
-      (assert= 12.0 (get-in timing [:gauge :dataPoints 0 :asDouble])))))
+      (assert= 12.0 (map/get-in timing [:gauge :dataPoints 0 :asDouble])))))
 
 (describe "the provider"
   (test "logs, metrics and errors POST JSON to their paths with the configured headers"
@@ -102,7 +102,7 @@
           (into [] (map sent first)))
         (assert= {"x-api-key" "k"} (nth (first sent) 2))
         (assert= "up"
-          (get-in (json/decode (second (first sent)))
+          (map/get-in (json/decode (second (first sent)))
             [:resourceLogs 0 :scopeLogs 0 :logRecords 0 :body :stringValue])))))
   (test "a refusal is an error the shipper can log"
     (let (r (recording 401)
