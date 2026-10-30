@@ -4,7 +4,7 @@
 (project
   :name "observe-otlp"
   :version "0.1.1"
-  :brood ">= 0.47.0"
+  :brood ">= 0.49.0"
   :description
     "OpenTelemetry (OTLP/HTTP, JSON) as an `observe` provider — logs, metrics and errors to any collector."
   :repository "https://github.com/broodlang/observe-otlp"

@@ -101,12 +101,12 @@
 
 (impl Provider
   otlp
-  (ship-logs [p context records]
+  (ship-logs (p context records)
     (post p "/v1/logs" (json/encode (logs-request p context (map records log-record)))))
-  (ship-metrics [p context metrics]
+  (ship-metrics (p context metrics)
     (post p "/v1/metrics" (json/encode (metrics-request p context metrics))))
   ;; Errors are log records too, at ERROR, with `exception.*` (see the file header).
-  (ship-errors [p context reports]
+  (ship-errors (p context reports)
     (post p "/v1/logs" (json/encode (logs-request p context (map reports error-record))))))
 
 ;; ---- the shared envelope ------------------------------------------------------------
