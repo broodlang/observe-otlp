@@ -39,7 +39,7 @@
   `\"brood\"`), `:transport` (a `(fn (url body headers) -> response)`, default `http/post` —
   for a test)."
   (otlp (let (e (get opts :endpoint *endpoint*))
-          (if (string/ends-with? e "/") (string/substring e 0 (dec (string/length e))) e))
+          (if (string/ends-with? e "/") (string/substring e 0 (dec (count e))) e))
     (get opts :headers {})
     (get opts :service "brood")
     (get opts :transport http-post)))
@@ -60,7 +60,7 @@
           (let (at (index-of entry "="))
             (when (> at 0)
               [(string/trim (string/substring entry 0 at))
-                (string/trim (string/substring entry (inc at) (string/length entry)))])))))))
+                (string/trim (string/substring entry (inc at) (count entry)))])))))))
 
 (defn settings (env)
   "The provider's options from an environment map (`var → value`): `{:endpoint :headers
