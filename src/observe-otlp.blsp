@@ -97,7 +97,7 @@
     (cond
       (and (>= status 200) (< status 300)) :ok
       (= status 0) [:error (str "observe-otlp: " (get resp :error "no response"))]
-      :else [:error (str "observe-otlp: " path " answered " status)])))
+      else [:error (str "observe-otlp: " path " answered " status)])))
 
 (impl Provider
   otlp
@@ -126,13 +126,13 @@
     (float? v) {:doubleValue v}
     (nil? v) {:stringValue "nil"}
     (keyword? v) {:stringValue (string/substring (str v) 1)}
-    :else {:stringValue (pr-str v)}))
+    else {:stringValue (pr-str v)}))
 
 (defn- attribute-key (k)
   (cond
     (keyword? k) (string/substring (str k) 1)
     (string? k) k
-    :else (str k)))
+    else (str k)))
 
 (defn attributes (m)
   "A map as OTLP attributes: `[{:key \"k\" :value <AnyValue>} …]`, nil values left out."
