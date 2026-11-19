@@ -3,7 +3,7 @@
 ;; buffering and the request worker are `observe`'s; this package is the wire format.
 (project
   :name "observe-otlp"
-  :version "0.1.5"
+  :version "0.1.6"
   :brood ">= 0.56.0"
   :description
     "OpenTelemetry (OTLP/HTTP, JSON) as an `observe` provider — logs, metrics and errors to any collector."
